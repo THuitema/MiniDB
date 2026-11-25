@@ -280,4 +280,205 @@ impl AppendLogDB {
     }
 }
 
-// TODO: write tests
+#[cfg(test)]
+mod tests {
+    use super::AppendLogDB;
+    use std::{
+        io::{self, Write},
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestLog {
+        path: PathBuf,
+    }
+
+    impl TestLog {
+        fn new() -> Self {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mini-db-{}-{timestamp}-{id}.log",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+
+    impl Drop for TestLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn missing_key_returns_none() -> io::Result<()> {
+        let log = TestLog::new();
+        let db = AppendLogDB::create(&log.path)?;
+
+        assert_eq!(db.get(b"missing")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn put_then_get_key() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+
+        db.put(b"name".to_vec(), b"Bob")?;
+
+        assert_eq!(db.get(b"name")?, Some(b"Bob".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn get_overwritten_value() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+
+        db.put(b"name".to_vec(), b"Bob")?;
+        db.put(b"name".to_vec(), b"Tom")?;
+
+        assert_eq!(db.get(b"name")?, Some(b"Tom".to_vec()));
+        drop(db);
+        Ok(())
+    }
+
+    #[test]
+    fn overwrite_survives_reopening() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+        db.put(b"name", b"Bob")?;
+        db.put(b"name", b"Tom")?;
+
+        assert_eq!(db.get(b"name")?, Some(b"Tom".to_vec()));
+        drop(db);
+
+        let db = AppendLogDB::open(&log.path)?;
+        assert_eq!(db.get(b"name")?, Some(b"Tom".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_key_returns_none() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+
+        db.put(b"name", b"Bob")?;
+        db.delete(b"name")?;
+
+        assert_eq!(db.get(b"name")?, None);
+        drop(db);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_survives_reopening() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+        db.put(b"name", b"Bob")?;
+        db.delete(b"name")?;
+
+        assert_eq!(db.get(b"name")?, None);
+        drop(db);
+
+        let db = AppendLogDB::open(&log.path)?;
+        assert_eq!(db.get(b"name")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn complex_reopen() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+        db.put(b"name", b"Bob")?;
+        db.put(b"age", b"21")?;
+        db.put(b"role", b"Engineer")?;
+        db.delete(b"age")?;
+        db.put(b"name", "Tom")?;
+
+        drop(db);
+
+        let db = AppendLogDB::open(&log.path)?;
+        assert_eq!(db.get(b"name")?, Some(b"Tom".to_vec()));
+        assert_eq!(db.get(b"age")?, None);
+        assert_eq!(db.get(b"role")?, Some(b"Engineer".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_keeps_only_latest_live_records() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+        db.put(b"name", b"Bob")?;
+        db.put(b"age", b"21")?;
+        db.put(b"role", b"Engineer")?;
+        db.delete(b"age")?;
+        db.put(b"name", b"Tom")?;
+
+        let size_before = std::fs::metadata(&log.path)?.len();
+        db.compact()?;
+
+        // Only two put records should remain: name=Tom (16 bytes) and role=Engineer (21 bytes)
+        assert!(std::fs::metadata(&log.path)?.len() < size_before);
+        assert_eq!(std::fs::metadata(&log.path)?.len(), 37);
+        assert_eq!(db.get(b"name")?, Some(b"Tom".to_vec()));
+        assert_eq!(db.get(b"age")?, None);
+        assert_eq!(db.get(b"role")?, Some(b"Engineer".to_vec()));
+
+        drop(db);
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_and_write_after_compact() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+        db.put(b"name", b"Bob")?;
+        db.put(b"age", b"21")?;
+        db.put(b"role", b"Engineer")?;
+        db.delete(b"age")?;
+        db.put(b"name", b"Tom")?;
+
+        db.compact()?;
+
+        // Only two put records should remain: name=Tom (16 bytes) and role=Engineer (21 bytes)
+        db.put(b"name", b"John")?;
+        db.put(b"role", b"Architect")?;
+
+        drop(db);
+        let db = AppendLogDB::open(&log.path)?;
+        assert_eq!(db.get(b"name")?, Some(b"John".to_vec()));
+        assert_eq!(db.get(b"age")?, None);
+        assert_eq!(db.get(b"role")?, Some(b"Architect".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_partial_record() -> io::Result<()> {
+        let log = TestLog::new();
+        let mut db = AppendLogDB::create(&log.path)?;
+        db.put(b"name", b"Bob")?;
+        drop(db);
+
+        // The record declares the value has 5 bytes, but only 2 are written
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log.path)?;
+        let mut record = vec![0];
+        record.extend_from_slice(&4u32.to_le_bytes());
+        record.extend_from_slice(b"lost");
+        record.extend_from_slice(&5u32.to_le_bytes());
+        record.extend_from_slice(b"ab");
+        file.write_all(&record)?;
+        drop(file);
+
+        let error = match AppendLogDB::open(&log.path) {
+            Ok(_) => panic!("open accepted a truncated record"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        Ok(())
+    }
+}
