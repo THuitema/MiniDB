@@ -3,7 +3,7 @@ Version 2: Append-only log
 */
 
 use std::os::unix::fs::FileExt;
-use std::{collections::HashMap, fs::File};
+use std::{collections::HashMap, fs::File, path::{Path, PathBuf}};
 use std::io::{self, BufReader, ErrorKind, Read, Seek, Write};
 use std::fs::OpenOptions;
 
@@ -14,7 +14,8 @@ const MAX_BYTES: usize = 4096;
 pub struct AppendLogDB {
     /* index maps key to byte offset of value length in log */
     index: HashMap<Vec<u8>, u64>,
-    file: File
+    file: File,
+    path: PathBuf
 }
 
 /*
@@ -29,28 +30,31 @@ enum Record {
 
 impl AppendLogDB {
     // Creates new data file
-    pub fn create() -> io::Result<Self> {
+    pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
         let file = match OpenOptions::new()
                                 .read(true)
                                 .append(true)
                                 .create_new(true)
-                                .open("data/store.log") {
+                                .open(path) {
             Err(e) => return Err(e),
             Ok(file) => file
         };
 
         Ok(Self {
             index: HashMap::new(),
-            file
+            file,
+            path: path.to_path_buf()
         })
     }
 
     // Reopens existing data file and attempts to rebuild index
-    pub fn open() -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
         let mut file = match OpenOptions::new()
                                 .read(true)
                                 .append(true)
-                                .open("data/store.log") {
+                                .open(path) {
             Err(e) => return Err(e),
             Ok(file) => file
         };
@@ -78,7 +82,8 @@ impl AppendLogDB {
 
         Ok(Self {
             index,
-            file
+            file,
+            path: path.to_path_buf()
         })
     }
 
@@ -144,11 +149,15 @@ impl AppendLogDB {
     // corresponding to the new log
     // note: sequential scan is generally more efficient than random seeks using the hash index's value offsets
     pub fn compact(&mut self) -> io::Result<()> {
+        let mut temp_path = self.path.as_os_str().to_os_string();
+        temp_path.push(".tmp");
+        let temp_path = PathBuf::from(temp_path);
+
         let mut compacted_file = match OpenOptions::new()
                                 .read(true)
                                 .append(true)
                                 .create_new(true)
-                                .open("data/store.log.tmp") {
+                                .open(&temp_path) {
             Err(e) => return Err(e),
             Ok(file) => file
         };
@@ -174,7 +183,7 @@ impl AppendLogDB {
         }
 
         // Replace original file and index with the compacted ones
-        std::fs::rename("data/store.log.tmp", "data/store.log")?;
+        std::fs::rename(&temp_path, &self.path)?;
         self.file = compacted_file;
         self.index = compacted_index;
 
