@@ -1,9 +1,5 @@
 /*
 Version 2: Append-only log 
-
-Record format
-Put record: <operation: u8 = 0><key_len: u32><key bytes><value_len: u32><value bytes>
-Delete record: <operation: u8 = 1><key_len: u32><key bytes>
 */
 
 use std::os::unix::fs::FileExt;
@@ -19,6 +15,16 @@ pub struct AppendLogDB {
     /* index maps key to byte offset of value length in log */
     index: HashMap<Vec<u8>, u64>,
     file: File
+}
+
+/*
+Record byte format
+Put record: <operation: u8 = 0><key_len: u32><key bytes><value_len: u32><value bytes>
+Delete record: <operation: u8 = 1><key_len: u32><key bytes>
+*/
+enum Record {
+    Put { key: Vec<u8>, value: Vec<u8>, value_offset: u64},
+    Delete { key: Vec<u8> }
 }
 
 impl AppendLogDB {
@@ -57,29 +63,16 @@ impl AppendLogDB {
         // default buffer size of 8 KiB
         let mut reader = BufReader::new(&mut file);
 
-        let mut op_buf = [0u8; OP_BYTES];
         loop {
-            match reader.read_exact(&mut op_buf) {
-                Ok(()) => {},
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e)
-            }
-
-            match op_buf[0] {
-                // put record
-                0 => {
-                    let key = Self::read_field(&mut reader)?;
-                    let value_offset = reader.stream_position()?;
-                    // Read the value to validate the record and advance to the next one.
-                    Self::read_field(&mut reader)?;
+            match Self::read_next_record(&mut reader) {
+                Ok(Some(Record::Put { key, value: _, value_offset })) => {
                     index.insert(key, value_offset);
                 },
-                // delete record
-                1 => {
-                    let key = Self::read_field(&mut reader)?;
+                Ok(Some(Record::Delete { key })) => {
                     index.remove(&key);
-                },
-                _ => return Err(io::Error::new(ErrorKind::InvalidData, "invalid operation code"))
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e)
             }
             
         }
@@ -96,7 +89,7 @@ impl AppendLogDB {
         let key = key.as_ref();
 
         match self.index.get(key) {
-            Some(offset) => self.read_value_at(*offset).map(Some),
+            Some(value_offset) => self.read_field_at(*value_offset).map(Some),
             None => Ok(None)
         }
     }
@@ -142,7 +135,7 @@ impl AppendLogDB {
 
         match self.index.get(key).copied() {
             Some(value_offset) => {
-                let value_buf = self.read_value_at(value_offset)?;
+                let value_buf = self.read_field_at(value_offset)?;
                 
                 // write delete record
                 let mut record = Vec::with_capacity(OP_BYTES + LEN_BYTES + key.len());
@@ -163,14 +156,33 @@ impl AppendLogDB {
 
     // TODO: compact
 
-    // converts a little-endian u32 to usize, while checking that it is less than the max length constraint
-    fn decode_len(bytes: [u8; LEN_BYTES]) -> io::Result<usize> {
-        let len = usize::try_from(u32::from_le_bytes(bytes))
-            .map_err(|_| io::Error::new(ErrorKind::InvalidData, format!("Length size does not fit usize")))?;
-        if len > MAX_BYTES {
-            return Err(io::Error::new(ErrorKind::InvalidData, format!("Length size exceeds limit")));
+    // Returns next record parsed into the Record enum
+    // If EOF, None is returned
+    fn read_next_record<R: Read + Seek>(reader: &mut R) -> io::Result<Option<Record>> {
+        let mut op_buf = [0u8; OP_BYTES];
+         match reader.read_exact(&mut op_buf) {
+            Ok(()) => {},
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None), // EOF
+            Err(e) => return Err(e)
         }
-        Ok(len)
+
+        match op_buf[0] {
+            // put record
+            0 => {
+                let key = Self::read_field(reader)?;
+                let value_offset = reader.stream_position()?;
+                let value = Self::read_field(reader)?;
+                return Ok(Some(Record::Put { key, value, value_offset }))
+                // index.insert(key, value_offset);
+            },
+            // delete record
+            1 => {
+                let key = Self::read_field(reader)?;
+                return Ok(Some(Record::Delete { key }))
+                // index.remove(&key);
+            },
+            _ => return Err(io::Error::new(ErrorKind::InvalidData, "invalid operation code"))
+        }
     }
 
     // read field at current seek position
@@ -184,12 +196,24 @@ impl AppendLogDB {
     }
 
     // read field at specific byte offset in file
-    // assume bytes are formatted
-    fn read_value_at(&self, offset: u64) -> io::Result<Vec<u8>> {
+    // assume bytes are formatted <length: u32><field bytes>
+    fn read_field_at(&self, offset: u64) -> io::Result<Vec<u8>> {
         let mut len_buf = [0u8; LEN_BYTES];
         self.file.read_exact_at(&mut len_buf, offset)?;
         let mut value = vec![0u8; Self::decode_len(len_buf)?];
         self.file.read_exact_at(&mut value, offset + LEN_BYTES as u64)?;
         Ok(value)
     }
+
+    // converts a little-endian u32 to usize, while checking that it is less than the max length constraint
+    fn decode_len(bytes: [u8; LEN_BYTES]) -> io::Result<usize> {
+        let len = usize::try_from(u32::from_le_bytes(bytes))
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, format!("Length size does not fit usize")))?;
+        if len > MAX_BYTES {
+            return Err(io::Error::new(ErrorKind::InvalidData, format!("Length size exceeds limit")));
+        }
+        Ok(len)
+    }
 }
+
+// TODO: write tests
