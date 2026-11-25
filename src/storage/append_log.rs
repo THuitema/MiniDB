@@ -34,7 +34,7 @@ impl AppendLogDB {
                                 .read(true)
                                 .append(true)
                                 .create_new(true)
-                                .open("data/0001.log") {
+                                .open("data/store.log") {
             Err(e) => return Err(e),
             Ok(file) => file
         };
@@ -50,7 +50,7 @@ impl AppendLogDB {
         let mut file = match OpenOptions::new()
                                 .read(true)
                                 .append(true)
-                                .open("data/0001.log") {
+                                .open("data/store.log") {
             Err(e) => return Err(e),
             Ok(file) => file
         };
@@ -74,7 +74,6 @@ impl AppendLogDB {
                 Ok(None) => break,
                 Err(e) => return Err(e)
             }
-            
         }
 
         Ok(Self {
@@ -88,8 +87,8 @@ impl AppendLogDB {
     pub fn get(&self, key: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> {
         let key = key.as_ref();
 
-        match self.index.get(key) {
-            Some(value_offset) => self.read_field_at(*value_offset).map(Some),
+        match self.index.get(key).copied() {
+            Some(value_offset) => self.read_field_at(value_offset).map(Some),
             None => Ok(None)
         }
     }
@@ -108,18 +107,8 @@ impl AppendLogDB {
             return Err(io::Error::new(ErrorKind::InvalidInput, "value size exceeds limit"));
         }
 
-        let record_start = self.file.seek(std::io::SeekFrom::End(0))?;
-        let value_offset = record_start + OP_BYTES as u64 + LEN_BYTES as u64 + key.len() as u64;
-
-        let mut record = Vec::with_capacity(OP_BYTES + 2 * LEN_BYTES + key.len() + value.len());
-        record.push(0);
-        record.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        record.extend_from_slice(&key);
-        record.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        record.extend_from_slice(value);
-
-        // WARNING: a failed write may still leave part of the record in the file
-        self.file.write_all(&record)?;
+        // write put record
+        let value_offset = Self::append_put_record(&mut self.file, &key, value)?;
 
         // update index after successfully writing the record
         self.index.insert(key, value_offset);
@@ -138,12 +127,7 @@ impl AppendLogDB {
                 let value_buf = self.read_field_at(value_offset)?;
                 
                 // write delete record
-                let mut record = Vec::with_capacity(OP_BYTES + LEN_BYTES + key.len());
-                record.push(1);
-                record.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                record.extend_from_slice(key);
-
-                self.file.write_all(&record)?;
+                Self::append_delete_record(&mut self.file, key)?;
 
                 // remove from index
                 self.index.remove(key);
@@ -154,7 +138,74 @@ impl AppendLogDB {
         }
     }
 
-    // TODO: compact
+    // note: sequential scan is generally more efficient than random seeks using the hash index's value offsets
+    pub fn compact(&mut self) -> io::Result<()> {
+        let mut compacted_file = match OpenOptions::new()
+                                .read(true)
+                                .append(true)
+                                .create_new(true)
+                                .open("data/store.log.tmp") {
+            Err(e) => return Err(e),
+            Ok(file) => file
+        };
+
+        let mut compacted_index: HashMap<Vec<u8>, u64> = HashMap::new();
+
+        self.file.seek(std::io::SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&mut self.file);
+
+        loop {
+            match Self::read_next_record(&mut reader) {
+                Ok(Some(Record::Put { key, value, value_offset })) => {
+                    // if this is the latest update for the key, add to the new log and index
+                    if self.index.get(&key) == Some(&value_offset) {
+                        let new_value_offset = Self::append_put_record(&mut compacted_file, &key, &value)?;
+                        compacted_index.insert(key, new_value_offset);
+                    }
+                },
+                Ok(Some(Record::Delete { key: _ })) => continue,
+                Ok(None) => break,
+                Err(e) => return Err(e)
+            }
+        }
+
+        // Replace original file and index with the compacted ones
+        std::fs::rename("data/store.log.tmp", "data/store.log")?;
+        self.file = compacted_file;
+        self.index = compacted_index;
+
+        Ok(())
+    }
+
+    /***** HELPER FUNCTIONS *****/
+
+    // Appends a Put record to the end of file, returning the offset of the value
+    fn append_put_record(file: &mut File, key: &[u8], value: &[u8]) -> io::Result<u64> {
+        let record_start = file.seek(std::io::SeekFrom::End(0))?;
+        let value_offset = record_start + OP_BYTES as u64 + LEN_BYTES as u64 + key.len() as u64;
+
+        let mut record = Vec::with_capacity(OP_BYTES + 2 * LEN_BYTES + key.len() + value.len());
+        record.push(0);
+        record.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        record.extend_from_slice(key);
+        record.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        record.extend_from_slice(value);
+
+        // WARNING: a failed partial-write may still leave part of the record in the file
+        file.write_all(&record)?;
+
+        Ok(value_offset)
+    }
+
+    // Appends a Delete record to the end of file
+    fn append_delete_record(file: &mut File, key: &[u8]) -> io::Result<()> {
+        let mut record = Vec::with_capacity(OP_BYTES + LEN_BYTES + key.len());
+        record.push(1);
+        record.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        record.extend_from_slice(key);
+        file.write_all(&record)?;
+        Ok(())
+    }
 
     // Returns next record parsed into the Record enum
     // If EOF, None is returned
