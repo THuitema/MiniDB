@@ -138,6 +138,10 @@ impl AppendLogDB {
         }
     }
 
+    // Creates a new log and hash index by removing all old redundant put records and delete records
+    // The new log will only contain the most recent key-value entries that haven't been deleted
+    // The new hash index will contain the same keys as before, but with updated value offsets
+    // corresponding to the new log
     // note: sequential scan is generally more efficient than random seeks using the hash index's value offsets
     pub fn compact(&mut self) -> io::Result<()> {
         let mut compacted_file = match OpenOptions::new()
