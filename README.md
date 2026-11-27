@@ -18,7 +18,7 @@ Just a HashMap, nothing special going on here. Requires all data to fit within m
 ## Version 2: Append-only Log
 File: `append_log.rs`
 
-This database writes key-value entries to disk. As the name suggests, entries are not overwritten. Instead, we append new entries to the end of the log to reflect updates. Meanwhile, we maintain an in-memory hash index that maps keys to the byte offset of the associated value on disk.
+This database writes key-value entries to disk. As the name suggests, entries are not overwritten. Instead, we append new entries to the end of the log to reflect updates. Meanwhile, we maintain an in-memory hash index that maps a key to the byte offset of its associated value and length on disk.
 
 This storage strategy allows for crash recovery. If our process terminates for any reason, `open()` sequentially scans the log file to rebuild the hash index.
 
