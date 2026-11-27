@@ -12,8 +12,8 @@ const LEN_BYTES: usize = 4;
 const MAX_BYTES: usize = 4096;
 
 pub struct AppendLogDB {
-    /* index maps key to byte offset of value length in log */
-    index: HashMap<Vec<u8>, u64>,
+    /* index maps key -> (value offset, value length) */
+    index: HashMap<Vec<u8>, (u64, usize)>,
     file: File,
     path: PathBuf
 }
@@ -70,15 +70,15 @@ impl AppendLogDB {
         file.seek(std::io::SeekFrom::Start(0))?;
 
         // scan file to build index
-        let mut index: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut index: HashMap<Vec<u8>, (u64, usize)> = HashMap::new();
 
         // default buffer size of 8 KiB
         let mut reader = BufReader::new(&mut file);
 
         loop {
             match Self::read_next_record(&mut reader) {
-                Ok(Some(Record::Put { key, value: _, value_offset })) => {
-                    index.insert(key, value_offset);
+                Ok(Some(Record::Put { key, value, value_offset })) => {
+                    index.insert(key, (value_offset, value.len()));
                 },
                 Ok(Some(Record::Delete { key })) => {
                     index.remove(&key);
@@ -101,7 +101,11 @@ impl AppendLogDB {
         let key = key.as_ref();
 
         match self.index.get(key).copied() {
-            Some(value_offset) => self.read_field_at(value_offset).map(Some),
+            Some((value_offset, value_len)) => {
+                let mut value = vec![0u8; value_len];
+                self.file.read_exact_at(&mut value, value_offset)?;
+                Ok(Some(value))
+            },
             None => Ok(None)
         }
     }
@@ -124,7 +128,7 @@ impl AppendLogDB {
         let value_offset = Self::append_put_record(&mut self.file, &key, value)?;
 
         // update index after successfully writing the record
-        self.index.insert(key, value_offset);
+        self.index.insert(key, (value_offset, value.len()));
 
         Ok(())
     }
@@ -136,8 +140,9 @@ impl AppendLogDB {
         let key = key.as_ref();
 
         match self.index.get(key).copied() {
-            Some(value_offset) => {
-                let value_buf = self.read_field_at(value_offset)?;
+            Some((value_offset, value_len)) => {
+                let mut value_buf = vec![0u8; value_len];
+                self.file.read_exact_at(&mut value_buf, value_offset)?;
                 
                 // write delete record
                 Self::append_delete_record(&mut self.file, key)?;
@@ -170,7 +175,7 @@ impl AppendLogDB {
             Ok(file) => file
         };
 
-        let mut compacted_index: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut compacted_index: HashMap<Vec<u8>, (u64, usize)> = HashMap::new();
 
         self.file.seek(std::io::SeekFrom::Start(0))?;
         let mut reader = BufReader::new(&mut self.file);
@@ -179,9 +184,9 @@ impl AppendLogDB {
             match Self::read_next_record(&mut reader) {
                 Ok(Some(Record::Put { key, value, value_offset })) => {
                     // if this is the latest update for the key, add to the new log and index
-                    if self.index.get(&key) == Some(&value_offset) {
+                    if self.index.get(&key) == Some(&(value_offset, value.len())) {
                         let new_value_offset = Self::append_put_record(&mut compacted_file, &key, &value)?;
-                        compacted_index.insert(key, new_value_offset);
+                        compacted_index.insert(key, (new_value_offset, value.len()));
                     }
                 },
                 Ok(Some(Record::Delete { key: _ })) => continue,
@@ -210,7 +215,7 @@ impl AppendLogDB {
     // Appends a Put record to the end of file, returning the offset of the value
     fn append_put_record(file: &mut File, key: &[u8], value: &[u8]) -> io::Result<u64> {
         let record_start = file.seek(std::io::SeekFrom::End(0))?;
-        let value_offset = record_start + OP_BYTES as u64 + LEN_BYTES as u64 + key.len() as u64;
+        let value_offset = record_start + OP_BYTES as u64 + 2 * LEN_BYTES as u64 + key.len() as u64;
 
         let mut record = Vec::with_capacity(OP_BYTES + 2 * LEN_BYTES + key.len() + value.len());
         record.push(0);
@@ -253,7 +258,7 @@ impl AppendLogDB {
             // put record
             0 => {
                 let key = Self::read_field(reader)?;
-                let value_offset = reader.stream_position()?;
+                let value_offset = reader.stream_position()? + LEN_BYTES as u64;
                 let value = Self::read_field(reader)?;
                 return Ok(Some(Record::Put { key, value, value_offset }))
                 // index.insert(key, value_offset);
@@ -276,16 +281,6 @@ impl AppendLogDB {
         let mut bytes = vec![0u8; Self::decode_len(len_buf)?];
         reader.read_exact(&mut bytes)?;
         Ok(bytes)
-    }
-
-    // read field at specific byte offset in file
-    // assume bytes are formatted <length: u32><field bytes>
-    fn read_field_at(&self, offset: u64) -> io::Result<Vec<u8>> {
-        let mut len_buf = [0u8; LEN_BYTES];
-        self.file.read_exact_at(&mut len_buf, offset)?;
-        let mut value = vec![0u8; Self::decode_len(len_buf)?];
-        self.file.read_exact_at(&mut value, offset + LEN_BYTES as u64)?;
-        Ok(value)
     }
 
     // converts a little-endian u32 to usize, while checking that it is less than the max length constraint
