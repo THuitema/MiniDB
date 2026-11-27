@@ -41,6 +41,14 @@ impl AppendLogDB {
             Ok(file) => file
         };
 
+        // Sync file to disk and parent directory 
+        file.sync_all()?;
+
+        let parent_dir = path.parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent_dir)?.sync_all()?;
+
         Ok(Self {
             index: HashMap::new(),
             file,
@@ -182,11 +190,18 @@ impl AppendLogDB {
             }
         }
 
+        compacted_file.sync_all()?; // persist all file contents and metadata to disk
+
         // Replace original file and index with the compacted ones
         std::fs::rename(&temp_path, &self.path)?;
         self.file = compacted_file;
         self.index = compacted_index;
 
+        // Force filesystem to commit the updated directory entry to disk
+        let parent_dir = self.path.parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent_dir)?.sync_all()?;
         Ok(())
     }
 
@@ -206,6 +221,7 @@ impl AppendLogDB {
 
         // WARNING: a failed partial-write may still leave part of the record in the file
         file.write_all(&record)?;
+        file.sync_data()?;
 
         Ok(value_offset)
     }
@@ -216,7 +232,10 @@ impl AppendLogDB {
         record.push(1);
         record.extend_from_slice(&(key.len() as u32).to_le_bytes());
         record.extend_from_slice(key);
+
         file.write_all(&record)?;
+        file.sync_data()?;
+
         Ok(())
     }
 
